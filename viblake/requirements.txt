@@ -1,0 +1,5 @@
+fastapi==0.115.14
+uvicorn[standard]==0.32.1
+pyarrow==18.1.0
+aiosqlite==0.20.0
+python-multipart==0.0.33

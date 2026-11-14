@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>风电场振动读数数据湖</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a2230; --line: #2a374d;
+    --text: #dce6f2; --muted: #8aa0bb; --accent: #4da3ff;
+    --green: #3ddc97; --amber: #ffc857; --red: #ff6b6b; --purple: #b39dff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header { padding: 18px 28px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 16px; }
+  header h1 { font-size: 19px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  main { padding: 22px 28px; max-width: 1280px; margin: 0 auto; display: grid; gap: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  .panel h2 { font-size: 15px; margin: 0 0 14px; color: var(--accent); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input[type=text], input[type=number], input[type=datetime-local], select {
+    width: 100%; background: #0d1320; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 13px;
+  }
+  button {
+    background: var(--accent); color: #08111f; border: 0; border-radius: 6px;
+    padding: 9px 16px; font-weight: 600; cursor: pointer; margin-top: 14px; font-size: 13px;
+  }
+  button.secondary { background: #31435f; color: var(--text); }
+  button.danger { background: var(--red); color: #1a0505; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .card { background: #0d1320; border: 1px solid var(--line); border-radius: 8px; padding: 10px 16px; min-width: 110px; }
+  .card .k { color: var(--muted); font-size: 11px; }
+  .card .v { font-size: 20px; font-weight: 700; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+  .pill.ok { background: rgba(61,220,151,.15); color: var(--green); }
+  .pill.run { background: rgba(77,163,255,.15); color: var(--accent); }
+  .pill.pause { background: rgba(255,200,87,.15); color: var(--amber); }
+  .pill.fail { background: rgba(255,107,107,.15); color: var(--red); }
+  .pill.done { background: rgba(179,157,255,.15); color: var(--purple); }
+  .switchline { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .switchline:last-child { border-bottom: 0; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  #toast { position: fixed; right: 22px; bottom: 22px; display: grid; gap: 8px; z-index: 9; }
+  .toast { padding: 11px 16px; border-radius: 8px; max-width: 420px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+  .toast.info { background: #233450; border: 1px solid var(--accent); }
+  .toast.err { background: #3d1d22; border: 1px solid var(--red); }
+  .toast.ok { background: #16352a; border: 1px solid var(--green); }
+  .scroll { max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+  code { background: #0d1320; padding: 1px 6px; border-radius: 4px; color: var(--amber); }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🌬️ 风电场振动读数数据湖</h1>
+  <span class="sub">FastAPI · PyArrow Parquet · SQLite 元数据 · 单进程 · 日分区小文件压实演示</span>
+  <span style="flex:1"></span>
+  <span id="globalGate" class="pill ok">开关：全部放行</span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>① 总览（每 3 秒自动刷新；展示各日分区文件数与行数）</h2>
+    <div class="cards" id="cards"></div>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>UTC 日分区</th><th>active 文件</th><th>待回收(superseded)</th>
+          <th>已回收(deleted)</th><th>active 行数</th>
+        </tr></thead>
+        <tbody id="dailyBody"><tr><td colspan="5" class="muted">暂无数据</td></tr></tbody>
+      </table>
+    </div>
+    <div class="hint">运行中的压实：<span id="runningJob" class="muted">无</span></div>
+  </section>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>② 上传 CSV 批次（≤ 10000 行，限同一 UTC 日）</h2>
+      <label>CSV 文件（列：<code>turbine,ts_utc,vibration</code>，重复行会原样保留）</label>
+      <input type="file" id="csvFile" accept=".csv,text/csv" />
+      <div class="row">
+        <button id="uploadBtn">上传并写成一个 Parquet</button>
+        <button class="secondary" id="demoBtn">生成并上传虚构读数</button>
+      </div>
+      <div class="row">
+        <div>
+          <label>虚构行数</label>
+          <input type="number" id="demoRows" value="200" min="1" max="10000" />
+        </div>
+        <div>
+          <label>UTC 日（留空=今天）</label>
+          <input type="text" id="demoDay" placeholder="2026-11-13" />
+        </div>
+        <div>
+          <label>机组（逗号分隔）</label>
+          <input type="text" id="demoTurbines" value="WTG-01,WTG-02,WTG-03" />
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>③ 演示开关（暂停合并 / 暂停查询，状态持久化，重启保持）</h2>
+      <div class="switchline">
+        <div>
+          <strong>合并开关</strong>
+          <div class="hint">暂停后：新压实请求被拒；进行中的任务在发布前安全检查点中止并回滚，不留新件</div>
+        </div>
+        <span id="mergeState" class="pill ok">放行中</span>
+      </div>
+      <div class="switchline">
+        <div>
+          <strong>查询开关</strong>
+          <div class="hint">暂停后：查询请求在服务端等待（不报错、不丢失），恢复后自动继续</div>
+        </div>
+        <span id="queryState" class="pill ok">放行中</span>
+      </div>
+      <div class="row">
+        <button class="danger" id="pauseMerge">暂停合并</button>
+        <button class="secondary" id="resumeMerge">恢复合并</button>
+        <button class="danger" id="pauseQuery">暂停查询</button>
+        <button class="secondary" id="resumeQuery">恢复查询</button>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>④ 查询读数（开始时固定文件集合，压实切换不漏行、不重行、不中断）</h2>
+    <div class="row">
+      <div>
+        <label>机组号（留空=全部机组）</label>
+        <input type="text" id="qTurbine" placeholder="WTG-01" />
+      </div>
+      <div>
+        <label>UTC 起时间（含）</label>
+        <input type="text" id="qStart" placeholder="2026-11-13T00:00:00Z" />
+      </div>
+      <div>
+        <label>UTC 止时间（不含）</label>
+        <input type="text" id="qEnd" placeholder="2026-11-14T00:00:00Z" />
+      </div>
+      <div>
+        <label>返回上限</label>
+        <input type="number" id="qLimit" value="1000" min="1" max="50000" />
+      </div>
+    </div>
+    <button id="queryBtn">查询</button>
+    <div class="hint" id="queryMeta">尚未查询</div>
+    <div class="scroll" style="margin-top:10px">
+      <table>
+        <thead><tr><th>机组</th><th>UTC 时间</th><th>振动值</th></tr></thead>
+        <tbody id="queryBody"><tr><td colspan="3" class="muted">无结果</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>⑤ 压实（一次只压实一份日分区；启动时固定该日文件，期间新上传文件保留）</h2>
+    <div class="row">
+      <div>
+        <label>UTC 日分区</label>
+        <input type="text" id="compactDay" placeholder="2026-11-13" />
+      </div>
+      <div style="display:flex;align-items:flex-end">
+        <button id="compactBtn">启动后台压实</button>
+      </div>
+    </div>
+    <div class="hint">旧文件转为 superseded，待所有查询快照释放后由后台回收器删除；刷新总览可见状态变化。</div>
+    <div class="scroll" style="margin-top:10px">
+      <table>
+        <thead><tr><th>ID</th><th>日分区</th><th>状态</th><th>产物文件</th><th>错误信息</th><th>完成时间</th></tr></thead>
+        <tbody id="jobBody"><tr><td colspan="6" class="muted">暂无任务</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function toast(msg, kind = "info") {
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  $("toast").appendChild(el);
+  setTimeout(() => el.remove(), 5200);
+}
+
+async function api(path, options = {}) {
+  const resp = await fetch(path, options);
+  let body = null;
+  try { body = await resp.json(); } catch { /* 非 JSON */ }
+  if (!resp.ok) {
+    const detail = body && body.detail ? body.detail : `HTTP ${resp.status}`;
+    throw new Error(detail);
+  }
+  return body;
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ---------- 总览 ----------
+async function refreshStats() {
+  try {
+    const s = await api("/api/stats");
+    const t = s.totals;
+    $("cards").innerHTML = [
+      ["日分区", t.partitions], ["active 文件", t.active_files],
+      ["待回收", t.superseded_files], ["已回收", t.deleted_files],
+      ["active 行数", t.active_rows],
+    ].map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+
+    $("dailyBody").innerHTML = s.daily.length
+      ? s.daily.map((d) => `<tr><td>${esc(d.day)}</td><td>${d.active_files}</td>
+          <td>${d.superseded_files}</td><td>${d.deleted_files}</td><td>${d.active_rows}</td></tr>`).join("")
+      : '<tr><td colspan="5" class="muted">暂无数据</td></tr>';
+
+    $("runningJob").innerHTML = s.running_compaction
+      ? `<span class="pill run">运行中 id=${s.running_compaction.id} day=${esc(s.running_compaction.day)}</span>`
+      : "无";
+
+    const g = s.gates;
+    $("mergeState").textContent = g.merge_paused ? "已暂停" : "放行中";
+    $("mergeState").className = "pill " + (g.merge_paused ? "pause" : "ok");
+    $("queryState").textContent = g.query_paused ? "已暂停" : "放行中";
+    $("queryState").className = "pill " + (g.query_paused ? "pause" : "ok");
+    const anyPaused = g.merge_paused || g.query_paused;
+    $("globalGate").textContent = anyPaused ? "开关：存在暂停项" : "开关：全部放行";
+    $("globalGate").className = "pill " + (anyPaused ? "pause" : "ok");
+
+    refreshJobs();
+  } catch (e) {
+    // 自动刷新静默失败，避免刷屏
+  }
+}
+
+async function refreshJobs() {
+  try {
+    const jobs = await api("/api/compactions");
+    $("jobBody").innerHTML = jobs.length
+      ? jobs.map((j) => {
+          const cls = j.status === "running" ? "run" : j.status === "published" ? "done" : "fail";
+          return `<tr><td>${j.id}</td><td>${esc(j.day)}</td>
+            <td><span class="pill ${cls}">${esc(j.status)}</span></td>
+            <td>${esc(j.new_file_id || "—")}</td>
+            <td>${esc(j.error || "—")}</td><td>${esc(j.finished_at || "—")}</td></tr>`;
+        }).join("")
+      : '<tr><td colspan="6" class="muted">暂无任务</td></tr>';
+  } catch { /* ignore */ }
+}
+
+// ---------- 上传 ----------
+$("uploadBtn").onclick = async () => {
+  const f = $("csvFile").files[0];
+  if (!f) return toast("请先选择 CSV 文件", "err");
+  const fd = new FormData();
+  fd.append("file", f);
+  try {
+    const r = await api("/api/readings", { method: "POST", body: fd });
+    toast(`上传成功：${r.day} 写入 ${r.rows} 行 → ${r.file_id}`, "ok");
+    refreshStats();
+  } catch (e) { toast("上传被拒绝：" + e.message, "err"); }
+};
+
+$("demoBtn").onclick = async () => {
+  const params = new URLSearchParams({
+    rows: $("demoRows").value,
+    turbines: $("demoTurbines").value,
+  });
+  if ($("demoDay").value.trim()) params.set("day", $("demoDay").value.trim());
+  try {
+    const r = await api("/api/demo/generate?" + params.toString(), { method: "POST" });
+    toast(`虚构读数已上传：${r.day}，${r.rows} 行，机组 ${r.turbines.join("/")}`, "ok");
+    refreshStats();
+  } catch (e) { toast("生成失败：" + e.message, "err"); }
+};
+
+// ---------- 开关 ----------
+async function setGate(kind, paused) {
+  try {
+    await api(`/api/demo/gates/${kind}?paused=${paused}`, { method: "POST" });
+    toast(`${kind === "merge" ? "合并" : "查询"}开关已${paused ? "暂停" : "恢复"}`, "ok");
+    refreshStats();
+  } catch (e) { toast(e.message, "err"); }
+}
+$("pauseMerge").onclick = () => setGate("merge", true);
+$("resumeMerge").onclick = () => setGate("merge", false);
+$("pauseQuery").onclick = () => setGate("query", true);
+$("resumeQuery").onclick = () => setGate("query", false);
+
+// ---------- 查询 ----------
+$("queryBtn").onclick = async () => {
+  const params = new URLSearchParams({ limit: $("qLimit").value });
+  if ($("qTurbine").value.trim()) params.set("turbine", $("qTurbine").value.trim());
+  if ($("qStart").value.trim()) params.set("start", $("qStart").value.trim());
+  if ($("qEnd").value.trim()) params.set("end", $("qEnd").value.trim());
+  $("queryMeta").textContent = "查询中（若查询开关暂停，请求会在服务端等待）…";
+  const started = performance.now();
+  try {
+    const r = await api("/api/readings/query?" + params.toString());
+    $("queryMeta").innerHTML = `快照 #${r.snapshot_id} 固定 <strong>${r.files_in_snapshot}</strong> 个文件，`
+      + `实扫 ${r.files_scanned} 个；命中 <strong>${r.matched_rows}</strong> 行，返回 ${r.returned_rows} 行`
+      + (r.truncated ? ' <span class="pill pause">已截断</span>' : "")
+      + `（耗时 ${Math.round(performance.now() - started)} ms）`;
+    $("queryBody").innerHTML = r.rows.length
+      ? r.rows.map((x) => `<tr><td>${esc(x.turbine)}</td><td>${esc(x.ts_utc)}</td><td>${x.vibration}</td></tr>`).join("")
+      : '<tr><td colspan="3" class="muted">无匹配行</td></tr>';
+  } catch (e) {
+    $("queryMeta").textContent = "查询失败：" + e.message;
+  }
+};
+
+// ---------- 压实 ----------
+$("compactBtn").onclick = async () => {
+  const day = $("compactDay").value.trim();
+  if (!day) return toast("请输入要压实的 UTC 日", "err");
+  try {
+    const r = await api(`/api/compactions?day=${encodeURIComponent(day)}`, { method: "POST" });
+    toast(`压实任务已启动（202）：id=${r.compaction_id} day=${r.day}，后台执行中`, "ok");
+    setTimeout(refreshStats, 400);
+    setTimeout(refreshStats, 1500);
+  } catch (e) { toast("无法启动压实：" + e.message, "err"); }
+};
+
+refreshStats();
+setInterval(refreshStats, 3000);
+</script>
+</body>
+</html>
