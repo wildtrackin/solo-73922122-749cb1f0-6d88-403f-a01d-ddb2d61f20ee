@@ -26,6 +26,7 @@ from app.compaction import CompactionError, CompactionManager  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.csv_import import ValidationError, parse_readings  # noqa: E402
 from app.db import Database  # noqa: E402
+from app.faults import FaultInjector  # noqa: E402
 from app.gates import PauseGate  # noqa: E402
 from app.service import DataLakeService  # noqa: E402
 
@@ -57,13 +58,15 @@ class Harness:
         self.settings = settings
         self.db = Database(settings.db_path)
         self.gate = PauseGate()
-        self.cm = CompactionManager(self.db, settings.lake_dir, self.gate)
-        self.svc = DataLakeService(self.db, settings, self.gate, self.cm)
+        self.faults = FaultInjector()
+        self.cm = CompactionManager(self.db, settings.lake_dir, self.gate, self.faults)
+        self.svc = DataLakeService(self.db, settings, self.gate, self.cm, self.faults)
 
     async def start(self) -> None:
         ps.ensure_dirs(self.settings.lake_dir)
         await self.db.connect()
         await self.gate.load(self.db)
+        await self.faults.load(self.db)
         await self.cm.start_reaper()
 
     async def stop(self) -> None:
@@ -437,6 +440,121 @@ async def test_crash_recovery() -> None:
         await h2.stop()
 
 
+async def test_reap_fault_after_publish() -> None:
+    print("[10] 发布后回收报错：不得改报压实失败，不得撤销新件")
+    s = make_settings("reapfault")
+    h = Harness(s)
+    await h.start()
+    try:
+        for i in range(2):
+            await h.upload([("WTG-01", ts(8, i * 5 + j), float(j)) for j in range(5)])
+        old = await h.db.list_active_files(None, DAY, DAY)
+        old_paths = [f["path"] for f in old]
+
+        # 开启演示故障：回收旧件时报磁盘错误
+        await h.svc.set_reap_fault(True)
+
+        cid, _ = await h.svc.start_compaction(DAY)
+        for _ in range(200):
+            row = await h.svc.compaction_status(cid)
+            if row["status"] != "running":
+                break
+            await asyncio.sleep(0.05)
+        row = dict(await h.svc.compaction_status(cid))
+
+        check("回收报错后任务仍为 published", row["status"] == "published", str(row))
+        check("任务错误信息为空（回收错误不污染任务结果）", not row["error"], str(row))
+        check("回收未决状态被记录", row["reap_status"] == "pending", str(row))
+        check("未回收旧件数量为 2", int(row["reap_pending"]) == 2, str(row))
+        check("回收错误有说明", bool(row["reap_error"]), str(row))
+
+        # 已发布的新件存在且被查询快照指向
+        new_rel = ps.final_path(DAY, row["new_file_id"])
+        check("已发布合并件仍在磁盘", os.path.exists(os.path.join(s.lake_dir, new_rel)))
+        stats = await h.svc.stats()
+        check("日分区 active 文件为 1（新件未被撤销）",
+              stats["totals"]["active_files"] == 1, str(stats["totals"]))
+        r = await h.query_all()
+        check("查询快照指向新件且数据完整 10 行",
+              r["files_in_snapshot"] == 1 and r["matched_rows"] == 10, str(r))
+        check("旧件因回收失败仍保留",
+              all(os.path.exists(os.path.join(s.lake_dir, p)) for p in old_paths))
+
+        # 再调用一次 fail_compaction 也不能篡改已发布任务
+        await h.db.fail_compaction(cid, "人为调用的失败")
+        row2 = dict(await h.svc.compaction_status(cid))
+        check("数据库守卫拒绝把 published 改报 failed",
+              row2["status"] == "published", str(row2))
+
+        # 关闭故障：后台回收器继续回收旧件，任务仍 published
+        await h.svc.set_reap_fault(False)
+        for _ in range(60):
+            stats = await h.svc.stats()
+            if stats["totals"]["superseded_files"] == 0:
+                break
+            await asyncio.sleep(0.1)
+        check("关闭故障后旧件被回收（superseded=0）",
+              stats["totals"]["superseded_files"] == 0, str(stats["totals"]))
+        check("旧件已从磁盘删除",
+              all(not os.path.exists(os.path.join(s.lake_dir, p)) for p in old_paths))
+        for _ in range(30):
+            row3 = dict(await h.svc.compaction_status(cid))
+            if row3["reap_status"] == "clean":
+                break
+            await asyncio.sleep(0.1)
+        check("任务回收状态落定为 clean", row3["reap_status"] == "clean", str(row3))
+        check("回收完成后任务仍为 published", row3["status"] == "published")
+        r = await h.query_all()
+        check("回收后数据仍完整 10 行", r["matched_rows"] == 10)
+    finally:
+        await h.stop()
+
+
+async def test_publish_failure_still_fails() -> None:
+    print("[11] 发布前登记失败：仍报 failed，不暴露未发布合并件")
+    s = make_settings("publishfail")
+    h = Harness(s)
+    await h.start()
+    try:
+        for i in range(2):
+            await h.upload([("WTG-01", ts(8, i * 5 + j), float(j)) for j in range(5)])
+
+        real_publish = h.db.publish_compaction
+
+        async def broken_publish(*args, **kwargs):
+            raise RuntimeError("模拟登记失败：数据库写入错误")
+
+        h.db.publish_compaction = broken_publish  # type: ignore[method-assign]
+        cid, _ = await h.svc.start_compaction(DAY)
+        for _ in range(200):
+            row = dict(await h.svc.compaction_status(cid))
+            if row["status"] != "running":
+                break
+            await asyncio.sleep(0.05)
+        h.db.publish_compaction = real_publish  # type: ignore[method-assign]
+
+        check("发布登记失败时任务为 failed", row["status"] == "failed", str(row))
+        check("失败原因如实记录", "模拟登记失败" in (row["error"] or ""), str(row))
+        stats = await h.svc.stats()
+        check("原 active 文件全部保留（2 个）", stats["totals"]["active_files"] == 2,
+              str(stats["totals"]))
+        r = await h.query_all()
+        check("原活动读数仍可查 10 行", r["matched_rows"] == 10, str(r))
+        # 未发布的合并件不得残留在日分区目录，也不得被查询看到
+        disk = ps.list_disk_paths(s.lake_dir)
+        merged_left = [p for p in disk if os.path.basename(p).startswith("compact-")]
+        check("未发布合并件已移除（不暴露半成品）", not merged_left, str(merged_left))
+        check("查询快照仍只含原来 2 个文件", r["files_in_snapshot"] == 2, str(r))
+
+        # 恢复正常后重新压实成功
+        job = await h.compact(DAY)
+        check("恢复后重新压实成功", job["status"] == "published", str(job))
+        r = await h.query_all()
+        check("重新压实后数据仍为 10 行", r["matched_rows"] == 10)
+    finally:
+        await h.stop()
+
+
 async def test_gate_persistence() -> None:
     print("[9] 开关状态跨重启持久化")
     s = make_settings("persist")
@@ -467,6 +585,8 @@ async def main() -> int:
     await test_gates()
     await test_multi_day()
     await test_crash_recovery()
+    await test_reap_fault_after_publish()
+    await test_publish_failure_still_fails()
     await test_gate_persistence()
     print("\n" + "=" * 56)
     print(f"通过 {PASSED} 项，失败 {len(FAILED)} 项")

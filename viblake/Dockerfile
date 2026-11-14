@@ -7,6 +7,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY examples ./examples
+COPY README.md ./
 
 # 数据目录由 compose 挂载命名卷；SQLite 与 Parquet 均在其中
 ENV VIBLAKE_DATA_DIR=/data \

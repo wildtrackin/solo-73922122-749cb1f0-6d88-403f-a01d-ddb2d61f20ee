@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import contextlib
 import asyncio
+import logging
 from typing import Any, AsyncIterator, Iterable, Sequence
 
 import aiosqlite
+
+logger = logging.getLogger("viblake.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -50,16 +53,28 @@ CREATE TABLE IF NOT EXISTS snapshot_files (
 CREATE INDEX IF NOT EXISTS idx_sf_file ON snapshot_files(file_id);
 
 CREATE TABLE IF NOT EXISTS compactions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    day         TEXT NOT NULL,
-    status      TEXT NOT NULL,             -- running / published / failed
-    temp_path   TEXT,
-    new_file_id TEXT REFERENCES files(id),
-    error       TEXT,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    finished_at TEXT
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    day          TEXT NOT NULL,
+    status       TEXT NOT NULL,            -- running / published / failed
+    temp_path    TEXT,
+    new_file_id  TEXT REFERENCES files(id),
+    error        TEXT,
+    -- 发布已提交后的回收结果；与任务状态解耦：
+    -- clean = 旧件已全部回收；pending = 尚有旧件未回收（等待后续回收 / 重启清理）
+    reap_status  TEXT,
+    reap_error   TEXT,
+    reap_pending INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    finished_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_comp_status ON compactions(status);
+
+CREATE TABLE IF NOT EXISTS compaction_files (
+    compaction_id INTEGER NOT NULL REFERENCES compactions(id),
+    file_id       TEXT NOT NULL REFERENCES files(id),
+    PRIMARY KEY (compaction_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cf_file ON compaction_files(file_id);
 
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -87,7 +102,30 @@ class Database:
             await conn.execute("PRAGMA busy_timeout=5000")
             await conn.execute("PRAGMA synchronous=NORMAL")
         await self._writer.executescript(SCHEMA)
+        await self._migrate()
         await self._writer.commit()
+
+    async def _migrate(self) -> None:
+        """轻量迁移：旧库补上发布后回收相关的列（默认视为回收未决）。"""
+        assert self._writer is not None
+        async with self._writer.execute("PRAGMA table_info(compactions)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        additions = {
+            "reap_status": "TEXT",
+            "reap_error": "TEXT",
+            "reap_pending": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, decl in additions.items():
+            if name not in columns:
+                await self._writer.execute(
+                    f"ALTER TABLE compactions ADD COLUMN {name} {decl}"
+                )
+        if "reap_status" not in columns:
+            # 旧库中已发布的历史任务：回收结果未知，先按未决处理，由恢复流程核对后落定
+            await self._writer.execute(
+                "UPDATE compactions SET reap_status='pending' "
+                "WHERE status='published' AND reap_status IS NULL"
+            )
 
     async def close(self) -> None:
         for conn in (self._writer, self._reader):
@@ -267,7 +305,12 @@ class Database:
         turbines: Iterable[str],
         old_ids: Sequence[str],
     ) -> None:
-        """压实发布：新文件登记为 active，旧文件转 superseded（不立即删除）。"""
+        """压实发布：新文件登记为 active，旧文件转 superseded（不立即删除）。
+
+        发布与状态提交在同一个事务内完成。事务提交后，任务就是 published；
+        后续回收无论成败都不能改变这一事实。旧件登记在 compaction_files，
+        以便追踪“发布后尚未回收”的旧件。
+        """
         async with self.tx() as conn:
             await conn.execute(
                 "INSERT INTO files(id, day, path, row_count, state) VALUES (?,?,?,?,'active')",
@@ -284,19 +327,108 @@ class Database:
                     f"WHERE id IN ({placeholders}) AND state='active'",
                     list(old_ids),
                 )
+                await conn.executemany(
+                    "INSERT OR IGNORE INTO compaction_files(compaction_id, file_id) "
+                    "VALUES (?,?)",
+                    [(compaction_id, fid) for fid in old_ids],
+                )
             await conn.execute(
-                "UPDATE compactions SET status='published', new_file_id=?, "
+                "UPDATE compactions SET status='published', new_file_id=?, temp_path=NULL, "
+                "reap_status='pending', reap_pending=?, reap_error=NULL, "
                 "finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
-                (new_file_id, compaction_id),
+                (new_file_id, len(old_ids), compaction_id),
             )
 
     async def fail_compaction(self, compaction_id: int, error: str) -> None:
+        """只允许把仍处于 running 的任务置为 failed。
+
+        发布事务已提交的任务（published）绝不能被回收等后续阶段改报失败，
+        已发布的新件也不能被撤销。此守卫在数据库层强制该性质。
+        """
         async with self.tx() as conn:
-            await conn.execute(
+            cur = await conn.execute(
                 "UPDATE compactions SET status='failed', error=?, "
-                "finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                "finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE id=? AND status='running'",
                 (error[:500], compaction_id),
             )
+            if cur.rowcount == 0:
+                logger.warning(
+                    "忽略对已结束压实任务 %s 的失败请求（当前状态非 running）",
+                    compaction_id,
+                )
+
+    async def update_reap_outcome(
+        self, compaction_id: int, error: str | None = None
+    ) -> dict[str, object]:
+        """刷新发布后回收结果；任务状态保持 published 不变。
+
+        - 所有旧件都已回收：reap_status='clean'
+        - 仍有旧件未回收：reap_status='pending'，记录最近一次回收错误
+        """
+        async with self.tx() as conn:
+            pending = await self._count_unreaped_old_files(conn, compaction_id)
+            status = "clean" if pending == 0 else "pending"
+            final_error = None if pending == 0 else error
+            await conn.execute(
+                "UPDATE compactions SET reap_status=?, reap_error=?, reap_pending=? "
+                "WHERE id=?",
+                (
+                    status,
+                    final_error[:500] if final_error else None,
+                    pending,
+                    compaction_id,
+                ),
+            )
+            return {"reap_status": status, "reap_pending": pending, "reap_error": final_error}
+
+    async def pending_reap_compactions(self) -> list[aiosqlite.Row]:
+        return await self.query_all(
+            "SELECT * FROM compactions WHERE status='published' "
+            "AND reap_status='pending' ORDER BY id"
+        )
+
+    async def reap_owner_map(self, file_ids: Sequence[str]) -> dict[str, int]:
+        """旧文件 id -> 产生它的压实任务 id，用于把回收错误归到正确任务。"""
+        if not file_ids:
+            return {}
+        placeholders = ",".join("?" for _ in file_ids)
+        rows = await self.query_all(
+            f"SELECT compaction_id, file_id FROM compaction_files "
+            f"WHERE file_id IN ({placeholders})",
+            list(file_ids),
+        )
+        return {r["file_id"]: int(r["compaction_id"]) for r in rows}
+
+    @staticmethod
+    async def _count_unreaped_old_files(
+        conn: aiosqlite.Connection, compaction_id: int
+    ) -> int:
+        async with conn.execute(
+            "SELECT COUNT(*) FROM compaction_files cf "
+            "JOIN files f ON f.id = cf.file_id "
+            "WHERE cf.compaction_id = ? AND f.state != 'deleted'",
+            (compaction_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        count = int(row[0]) if row else 0
+        if count:
+            return count
+        async with conn.execute(
+            "SELECT COUNT(*) FROM compaction_files WHERE compaction_id=?",
+            (compaction_id,),
+        ) as cur:
+            tracked = await cur.fetchone()
+        if tracked and int(tracked[0]) > 0:
+            return 0
+        # 旧库没有 compaction_files 记录（迁移前发布的）：按日分区内 superseded 估算
+        async with conn.execute(
+            "SELECT COUNT(*) FROM files f JOIN compactions c ON c.day = f.day "
+            "WHERE c.id = ? AND f.state = 'superseded'",
+            (compaction_id,),
+        ) as cur:
+            legacy = await cur.fetchone()
+        return int(legacy[0]) if legacy else 0
 
     async def get_compaction(self, compaction_id: int) -> aiosqlite.Row | None:
         return await self.query_one("SELECT * FROM compactions WHERE id=?", (compaction_id,))

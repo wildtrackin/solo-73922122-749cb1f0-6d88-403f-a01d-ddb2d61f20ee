@@ -11,6 +11,7 @@ from .compaction import CompactionError, CompactionManager
 from .config import Settings
 from .csv_import import parse_readings
 from .db import Database
+from .faults import FaultInjector
 from .gates import PauseGate
 
 
@@ -36,11 +37,13 @@ class DataLakeService:
         settings: Settings,
         gate: PauseGate,
         compaction: CompactionManager,
+        faults: FaultInjector | None = None,
     ) -> None:
         self._db = db
         self._settings = settings
         self._gate = gate
         self._compaction = compaction
+        self._faults = faults or FaultInjector()
         self._io_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="svc-io")
         self._bg: dict[int, asyncio.Task] = {}
 
@@ -146,6 +149,10 @@ class DataLakeService:
             "daily": daily,
             "running_compaction": dict(running) if running else None,
             "gates": self._gate.snapshot(),
+            "faults": self._faults.snapshot(),
+            "pending_reap": [
+                dict(r) for r in await self._db.pending_reap_compactions()
+            ],
         }
 
     # ---------------- 压实 ----------------
@@ -194,6 +201,12 @@ class DataLakeService:
         else:
             raise ValueError(f"未知开关: {kind}")
         return self._gate.snapshot()
+
+    # ---------------- 演示故障 ----------------
+
+    async def set_reap_fault(self, enabled: bool) -> dict[str, object]:
+        await self._faults.set_reap_error(self._db, enabled)
+        return self._faults.snapshot()
 
     # ---------------- 虚构读数 ----------------
 

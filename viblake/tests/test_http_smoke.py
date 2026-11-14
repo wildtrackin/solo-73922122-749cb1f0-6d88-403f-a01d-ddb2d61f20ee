@@ -131,4 +131,52 @@ with TestClient(app) as client:
     assert stats["totals"]["active_files"] == 2  # 每日 1 个压实件
     assert stats["totals"]["partitions"] == 2
 
+    # ---------- 发布后回收报错演示 ----------
+    # 造两个新批次件（新的一天，避免与已压实的日分区混在一起）
+    day = "2026-11-15"
+    for _ in range(2):
+        r = client.post(f"/api/demo/generate?rows=10&day={day}")
+        assert r.status_code == 200, r.text
+
+    r = client.post("/api/demo/faults/reap?enabled=true")
+    assert r.status_code == 200 and r.json()["reap_error"] is True, r.text
+    print("reap fault enabled")
+
+    r = client.post(f"/api/compactions?day={day}")
+    assert r.status_code == 202, r.text
+    cid3 = r.json()["compaction_id"]
+    for _ in range(100):
+        job3 = client.get(f"/api/compactions/{cid3}").json()
+        if job3["status"] != "running":
+            break
+        time.sleep(0.1)
+    print("compaction with reap fault:", job3["status"], "| reap:",
+          job3["reap_status"], job3["reap_pending"], "| error:", job3["reap_error"])
+    assert job3["status"] == "published", job3
+    assert not job3["error"], job3
+    assert job3["reap_status"] == "pending" and job3["reap_pending"] == 2, job3
+    assert job3["reap_error"], job3
+
+    # 已发布新件可见，查询不中断
+    q = client.get(f"/api/readings/query?start={day}T00:00:00Z&end=2026-11-16T00:00:00Z").json()
+    assert q["matched_rows"] == 20 and q["files_in_snapshot"] == 1, q
+    print("published merge visible with 20 rows, reap pending not reported as failure")
+
+    stats = client.get("/api/stats").json()
+    assert stats["faults"]["reap_error"] is True
+    assert [p["id"] for p in stats["pending_reap"]] == [cid3], stats["pending_reap"]
+
+    # 关闭故障 -> 后台回收器清掉旧件，任务仍 published 并最终变为 clean
+    r = client.post("/api/demo/faults/reap?enabled=false")
+    assert r.json()["reap_error"] is False
+    for _ in range(60):
+        job3 = client.get(f"/api/compactions/{cid3}").json()
+        if job3["reap_status"] == "clean":
+            break
+        time.sleep(0.1)
+    assert job3["status"] == "published" and job3["reap_status"] == "clean", job3
+    stats = client.get("/api/stats").json()
+    assert stats["totals"]["superseded_files"] == 0, stats["totals"]
+    print("after disabling fault: old files reaped, task still published/clean")
+
 print("\nHTTP 冒烟测试全部通过 ✅")

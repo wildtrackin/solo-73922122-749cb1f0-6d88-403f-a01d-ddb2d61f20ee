@@ -50,6 +50,8 @@
   .pill.pause { background: rgba(255,200,87,.15); color: var(--amber); }
   .pill.fail { background: rgba(255,107,107,.15); color: var(--red); }
   .pill.done { background: rgba(179,157,255,.15); color: var(--purple); }
+  .pill.warn { background: rgba(255,200,87,.18); color: var(--amber); }
+  .pill.strike { background: rgba(255,107,107,.15); color: var(--red); text-decoration: line-through; }
   .switchline { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--line); }
   .switchline:last-child { border-bottom: 0; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
@@ -135,6 +137,23 @@
         <button class="secondary" id="resumeQuery">恢复查询</button>
       </div>
     </section>
+
+    <section class="panel">
+      <h2>③b 发布后回收报错演示（只影响旧件回收，不影响压实结果）</h2>
+      <div class="switchline">
+        <div>
+          <strong>回收磁盘错误</strong>
+          <div class="hint">开启后启动压实：合并件照常发布、查询立即可见；删除旧件时报磁盘错误，
+            任务仍为 published，仅标记“回收未决”，旧件留待后续回收或重启清理</div>
+        </div>
+        <span id="faultState" class="pill ok">未启用</span>
+      </div>
+      <div class="row">
+        <button class="danger" id="enableFault">启用回收报错</button>
+        <button class="secondary" id="disableFault">关闭回收报错</button>
+      </div>
+      <div id="pendingReap" class="hint"></div>
+    </section>
   </div>
 
   <section class="panel">
@@ -181,10 +200,12 @@
     <div class="hint">旧文件转为 superseded，待所有查询快照释放后由后台回收器删除；刷新总览可见状态变化。</div>
     <div class="scroll" style="margin-top:10px">
       <table>
-        <thead><tr><th>ID</th><th>日分区</th><th>状态</th><th>产物文件</th><th>错误信息</th><th>完成时间</th></tr></thead>
-        <tbody id="jobBody"><tr><td colspan="6" class="muted">暂无任务</td></tr></tbody>
+        <thead><tr><th>ID</th><th>日分区</th><th>任务结果</th><th>发布后回收</th><th>产物文件</th><th>错误信息</th><th>完成时间</th></tr></thead>
+        <tbody id="jobBody"><tr><td colspan="7" class="muted">暂无任务</td></tr></tbody>
       </table>
     </div>
+    <div class="hint">任务结果与回收结果分开：发布事务提交后，“任务结果”永不再变；
+      回收报错只显示在“发布后回收”列，不会把已发布任务标成 failed。</div>
   </section>
 </main>
 
@@ -246,6 +267,16 @@ async function refreshStats() {
     $("globalGate").textContent = anyPaused ? "开关：存在暂停项" : "开关：全部放行";
     $("globalGate").className = "pill " + (anyPaused ? "pause" : "ok");
 
+    const faultOn = s.faults && s.faults.reap_error;
+    $("faultState").textContent = faultOn ? "已启用（回收会报错）" : "未启用";
+    $("faultState").className = "pill " + (faultOn ? "warn" : "ok");
+    const pending = s.pending_reap || [];
+    $("pendingReap").innerHTML = pending.length
+      ? "回收未决任务：" + pending.map((p) =>
+          `id=${p.id} day=${esc(p.day)} 未回收旧件 ${p.reap_pending} 个` +
+          (p.reap_error ? `（${esc(p.reap_error)}）` : "")).join("；")
+      : "当前没有回收未决的已发布任务";
+
     refreshJobs();
   } catch (e) {
     // 自动刷新静默失败，避免刷屏
@@ -258,12 +289,28 @@ async function refreshJobs() {
     $("jobBody").innerHTML = jobs.length
       ? jobs.map((j) => {
           const cls = j.status === "running" ? "run" : j.status === "published" ? "done" : "fail";
+          // 发布后回收：clean / pending / 尚未尝试（null）
+          let reap = '<span class="muted">—</span>';
+          if (j.status === "published") {
+            if (j.reap_status === "clean") reap = '<span class="pill ok">旧件已回收</span>';
+            else if (j.reap_status === "pending")
+              reap = j.reap_error
+                ? `<span class="pill warn">未决：${j.reap_pending || 0} 个旧件</span>`
+                : `<span class="pill pause">等待快照释放：${j.reap_pending || 0} 个旧件</span>`;
+            else reap = '<span class="muted">待回收</span>';
+          } else if (j.status === "failed" && j.reap_status) {
+            reap = '<span class="muted">未到回收阶段</span>';
+          }
+          const err = j.error
+            ? esc(j.error)
+            : (j.reap_error ? `<span class="muted">回收：${esc(j.reap_error)}</span>` : "—");
           return `<tr><td>${j.id}</td><td>${esc(j.day)}</td>
             <td><span class="pill ${cls}">${esc(j.status)}</span></td>
+            <td>${reap}</td>
             <td>${esc(j.new_file_id || "—")}</td>
-            <td>${esc(j.error || "—")}</td><td>${esc(j.finished_at || "—")}</td></tr>`;
+            <td>${err}</td><td>${esc(j.finished_at || "—")}</td></tr>`;
         }).join("")
-      : '<tr><td colspan="6" class="muted">暂无任务</td></tr>';
+      : '<tr><td colspan="7" class="muted">暂无任务</td></tr>';
   } catch { /* ignore */ }
 }
 
@@ -306,6 +353,19 @@ $("resumeMerge").onclick = () => setGate("merge", false);
 $("pauseQuery").onclick = () => setGate("query", true);
 $("resumeQuery").onclick = () => setGate("query", false);
 
+// ---------- 发布后回收报错演示 ----------
+async function setFault(enabled) {
+  try {
+    await api(`/api/demo/faults/reap?enabled=${enabled}`, { method: "POST" });
+    toast(enabled
+      ? "已启用回收报错：下一次压实会在发布后回收旧件时模拟磁盘错误（任务仍 published）"
+      : "已关闭回收报错：后台回收器将继续清掉未回收旧件", "ok");
+    refreshStats();
+  } catch (e) { toast(e.message, "err"); }
+}
+$("enableFault").onclick = () => setFault(true);
+$("disableFault").onclick = () => setFault(false);
+
 // ---------- 查询 ----------
 $("queryBtn").onclick = async () => {
   const params = new URLSearchParams({ limit: $("qLimit").value });
@@ -337,6 +397,7 @@ $("compactBtn").onclick = async () => {
     toast(`压实任务已启动（202）：id=${r.compaction_id} day=${r.day}，后台执行中`, "ok");
     setTimeout(refreshStats, 400);
     setTimeout(refreshStats, 1500);
+    setTimeout(refreshStats, 3500);
   } catch (e) { toast("无法启动压实：" + e.message, "err"); }
 };
 

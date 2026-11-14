@@ -15,6 +15,7 @@ from .compaction import CompactionError, CompactionManager
 from .config import settings
 from .csv_import import ValidationError
 from .db import Database
+from .faults import FaultInjector
 from .gates import PauseGate
 from .service import DataLakeService
 
@@ -25,8 +26,9 @@ WEB_DIR = Path(__file__).parent / "web"
 # 单进程内共享的组件（题目明确要求单进程网页）
 db = Database(settings.db_path)
 gate = PauseGate()
-compaction = CompactionManager(db, settings.lake_dir, gate)
-service = DataLakeService(db, settings, gate, compaction)
+faults = FaultInjector()
+compaction = CompactionManager(db, settings.lake_dir, gate, faults)
+service = DataLakeService(db, settings, gate, compaction, faults)
 
 
 def _parse_dt(raw: str | None, field: str) -> datetime | None:
@@ -52,6 +54,7 @@ async def lifespan(app: FastAPI):
     ps.ensure_dirs(settings.lake_dir)
     await db.connect()
     await gate.load(db)
+    await faults.load(db)
     recovery = await compaction.recover()
     if any(recovery.values()):
         logger.info("启动恢复结果: %s", recovery)
@@ -157,6 +160,20 @@ async def set_gate(
     if kind not in ("merge", "query"):
         raise HTTPException(status_code=422, detail="kind 仅支持 merge 或 query")
     return await service.set_gate(kind, paused)
+
+
+# ---------------- 演示故障（发布后回收报错） ----------------
+
+@app.post("/api/demo/faults/reap")
+async def set_reap_fault(
+    enabled: bool = Query(..., description="true=注入回收磁盘错误，false=恢复正常"),
+):
+    """只影响发布后的旧件回收，不会让已发布的压实任务改报失败。
+
+    开启后启动压实：合并件正常发布、查询可见；旧件回收报错并保留，
+    任务显示 published + 回收未决；关闭故障后由后台回收器继续清掉旧件。
+    """
+    return await service.set_reap_fault(enabled)
 
 
 # ---------------- 虚构读数 ----------------
